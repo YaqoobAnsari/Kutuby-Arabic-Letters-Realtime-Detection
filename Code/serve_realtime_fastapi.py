@@ -28,7 +28,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import torch
-from fastapi import FastAPI, UploadFile, File, Response
+from fastapi import FastAPI, UploadFile, File, Response, Form
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, PlainTextResponse
 import uvicorn
 
@@ -1479,6 +1479,126 @@ async def infer(audio: UploadFile = File(...), top_k: str = "5", fixed_seconds: 
         "hints": hints,
         "device": model.device.type.upper(),
         "sr_used": model.sampling_rate,
+    })
+
+
+# --------------------------- Verification endpoint for Postman testing ---------------------------
+
+@app.post("/verify_letter", response_class=JSONResponse)
+async def verify_letter(
+    audio: UploadFile = File(...),
+    target: str = Form(...),
+    threshold: float = Form(0.6),
+    fixed_seconds: str = Form("1.0")
+):
+    """
+    POST endpoint for Postman: verify if audio matches target letter.
+
+    Parameters:
+    - audio: WAV file (1-2 seconds recommended)
+    - target: Target letter string (e.g., "alif", "Alif", "ba", "Ba")
+    - threshold: Confidence threshold (default 0.6 = 60%)
+    - fixed_seconds: Audio window length (default 1.0 seconds)
+
+    Returns:
+    - True: if model detects target with ≥ threshold confidence
+    - False: otherwise
+    """
+    model = _load_once()
+
+    # Read WAV
+    content = await audio.read()
+    try:
+        y, sr = sf.read(io.BytesIO(content), dtype="float32", always_2d=False)
+    except Exception as e:
+        return JSONResponse(
+            {"error": f"Could not read audio file. Ensure it's a WAV file. Error: {type(e).__name__}: {e}", "result": False},
+            status_code=400
+        )
+
+    # Convert to mono if needed
+    if y.ndim > 1:
+        y = y.mean(axis=1)
+
+    # Parse fixed_seconds
+    try:
+        fx = float(fixed_seconds)
+    except:
+        fx = 1.0
+
+    # Run inference
+    start_time = time.perf_counter()
+    out = model.infer_numpy(y, sr_in=sr, top_k=len(model.id2label), fixed_seconds=fx)
+    latency_ms = (time.perf_counter() - start_time) * 1000
+
+    # Normalize target letter name (case-insensitive matching)
+    target_normalized = target.strip().lower()
+
+    # Find matching label in model vocabulary
+    target_label = None
+    target_probability = 0.0
+
+    # Create a mapping of lowercase labels to original labels
+    label_map = {label.lower(): label for label in model.id2label.values()}
+
+    if target_normalized in label_map:
+        target_label = label_map[target_normalized]
+        # Find the probability for this label
+        for i, (lbl, prob) in enumerate(out["topk"]):
+            if lbl == target_label:
+                target_probability = prob
+                break
+    else:
+        # Target not found in vocabulary
+        available_letters = ", ".join(sorted(model.id2label.values()))
+        return JSONResponse(
+            {
+                "error": f"Target letter '{target}' not found in model vocabulary.",
+                "available_letters": available_letters,
+                "result": False
+            },
+            status_code=400
+        )
+
+    # Determine result based on threshold
+    predicted_label = out["top1_label"]
+    predicted_probability = out["top1_prob"]
+
+    # Result is True only if:
+    # 1. The target letter's probability meets the threshold
+    # 2. The target letter is the top prediction
+    result = (target_probability >= threshold) and (predicted_label == target_label)
+
+    # Create response message
+    if result:
+        message = f"✓ Success: '{target_label}' detected with {target_probability*100:.2f}% confidence (threshold: {threshold*100:.0f}%)"
+    else:
+        if target_probability < threshold:
+            message = f"✗ Failed: '{target_label}' only has {target_probability*100:.2f}% confidence (threshold: {threshold*100:.0f}%). Predicted: '{predicted_label}' ({predicted_probability*100:.2f}%)"
+        else:
+            message = f"✗ Failed: Top prediction is '{predicted_label}' ({predicted_probability*100:.2f}%), not '{target_label}' ({target_probability*100:.2f}%)"
+
+    # Build probabilities dictionary for all letters
+    all_probabilities = {}
+    for i, label in model.id2label.items():
+        # Find probability for this label
+        prob = 0.0
+        for lbl, p in out["topk"]:
+            if lbl == label:
+                prob = p
+                break
+        all_probabilities[label] = float(prob)
+
+    return JSONResponse({
+        "result": result,
+        "target_letter": target_label,
+        "target_probability": float(target_probability),
+        "predicted_letter": predicted_label,
+        "predicted_probability": float(predicted_probability),
+        "threshold": float(threshold),
+        "message": message,
+        "latency_ms": float(latency_ms),
+        "all_probabilities": all_probabilities
     })
 
 
