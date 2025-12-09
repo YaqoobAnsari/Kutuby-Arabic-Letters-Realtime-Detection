@@ -18,7 +18,8 @@ Results/*
 # Keep small diagnostics only
 !Results/facebook__wav2vec2-base
 Results/facebook__wav2vec2-base/*
-!Results/facebook__wav2vec2-base/confusion_matrix.png
+# PNG removed for HF Space compatibility (no binary files allowed)
+# !Results/facebook__wav2vec2-base/confusion_matrix.png
 !Results/facebook__wav2vec2-base/per_class_report.csv
 !Results/facebook__wav2vec2-base/summary.json
 
