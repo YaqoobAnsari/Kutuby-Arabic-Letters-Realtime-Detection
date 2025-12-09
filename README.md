@@ -1,3 +1,12 @@
+---
+title: Arabic Pronunciation Trainer
+emoji: 🔤
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+---
+
 # Arabic Alphabet Realtime Recognition
 
 > **A production-ready FastAPI application for real-time Arabic letter recognition using wav2vec2-base**
