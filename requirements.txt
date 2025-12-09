@@ -1,6 +1,7 @@
 torch
 fastapi
 uvicorn[standard]
+python-multipart
 transformers
 soundfile
 matplotlib
