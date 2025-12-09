@@ -13,6 +13,9 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 COPY . .
 
+# Download the model from Hugging Face
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='yansari/arabic-letters-wav2vec2-base', local_dir='Models/facebook__wav2vec2-base')"
+
 EXPOSE 7860
 
 CMD ["python", "app.py"]
