@@ -1569,37 +1569,16 @@ async def verify_letter(
     # 2. The target letter is the top prediction
     result = (target_probability >= threshold) and (predicted_label == target_label)
 
-    # Create response message
+    # Minimal response (Option 2: Minimal + Context)
     if result:
-        message = f"✓ Success: '{target_label}' detected with {target_probability*100:.2f}% confidence (threshold: {threshold*100:.0f}%)"
+        return JSONResponse({
+            "result": True
+        })
     else:
-        if target_probability < threshold:
-            message = f"✗ Failed: '{target_label}' only has {target_probability*100:.2f}% confidence (threshold: {threshold*100:.0f}%). Predicted: '{predicted_label}' ({predicted_probability*100:.2f}%)"
-        else:
-            message = f"✗ Failed: Top prediction is '{predicted_label}' ({predicted_probability*100:.2f}%), not '{target_label}' ({target_probability*100:.2f}%)"
-
-    # Build probabilities dictionary for all letters
-    all_probabilities = {}
-    for i, label in model.id2label.items():
-        # Find probability for this label
-        prob = 0.0
-        for lbl, p in out["topk"]:
-            if lbl == label:
-                prob = p
-                break
-        all_probabilities[label] = float(prob)
-
-    return JSONResponse({
-        "result": result,
-        "target_letter": target_label,
-        "target_probability": float(target_probability),
-        "predicted_letter": predicted_label,
-        "predicted_probability": float(predicted_probability),
-        "threshold": float(threshold),
-        "message": message,
-        "latency_ms": float(latency_ms),
-        "all_probabilities": all_probabilities
-    })
+        return JSONResponse({
+            "result": False,
+            "predicted": predicted_label
+        })
 
 
 # --------------------------- CLI & optional ngrok share ---------------------------
