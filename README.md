@@ -1,3 +1,15 @@
+---
+title: Arabic Alphabet Pronunciation Trainer
+emoji: 🔤
+colorFrom: blue
+colorTo: green
+sdk: gradio
+sdk_version: "4.0.0"
+app_file: app.py
+pinned: false
+license: apache-2.0
+---
+
 # Arabic Alphabet Realtime Recognition
 
 > **A production-ready FastAPI application for real-time Arabic letter recognition using wav2vec2-base**
