@@ -1083,7 +1083,11 @@ class WavRecorder {
 
   async start() {
     if (this.recording) return;
-    this._stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    try {
+      this._stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+      throw new Error('Microphone access denied or not available. Please grant microphone permissions or use file upload instead.');
+    }
     this._audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     this.sampleRate = this._audioCtx.sampleRate;
     const source = this._audioCtx.createMediaStreamSource(this._stream);
@@ -1222,7 +1226,17 @@ btnStart.addEventListener('click', async () => {
 
   recorder = new WavRecorder();
   recorder.onlevel = (rms) => { level.style.width = Math.round(Math.min(100, rms*100)) + '%'; };
-  await recorder.start();
+
+  try {
+    await recorder.start();
+  } catch (err) {
+    alert(err.message || 'Failed to access microphone. Please use file upload instead.');
+    btnStart.disabled = false;
+    btnStop.disabled = true;
+    btnReset.disabled = false;
+    updateStatusIndicator('idle');
+    return;
+  }
 
   t0 = performance.now();
   timer.textContent = '0.0s';
