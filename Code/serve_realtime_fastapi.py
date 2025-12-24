@@ -1594,7 +1594,9 @@ async def verify_letter(
             "predicted": predicted_label
         })
 
-
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "model": "loaded"}
 # --------------------------- CLI & optional ngrok share ---------------------------
 
 def parse_args():
