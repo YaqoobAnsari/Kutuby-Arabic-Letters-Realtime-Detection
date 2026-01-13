@@ -21,8 +21,9 @@ COPY app.py .
 # Create directories for models and results (will be downloaded at runtime from HF)
 RUN mkdir -p ./Models ./Results
 
-# Set port (HF Spaces and Cloud Run use PORT env var)
+# Set environment variables
 ENV PORT=7860
+ENV MPLCONFIGDIR=/tmp/matplotlib
 EXPOSE 7860
 
 # Run the application
