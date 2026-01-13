@@ -24,6 +24,8 @@ RUN mkdir -p ./Models ./Results
 # Set environment variables
 ENV PORT=7860
 ENV MPLCONFIGDIR=/tmp/matplotlib
+ENV HF_HOME=/tmp/huggingface
+ENV TRANSFORMERS_CACHE=/tmp/huggingface
 EXPOSE 7860
 
 # Run the application

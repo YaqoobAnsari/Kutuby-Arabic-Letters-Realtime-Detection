@@ -37,7 +37,7 @@ try:
 except Exception:
     HAVE_RESAMPY = False
 
-from transformers import AutoProcessor, AutoModelForAudioClassification
+from transformers import Wav2Vec2Processor, AutoModelForAudioClassification
 
 # Google Cloud Storage support (optional)
 try:
@@ -284,7 +284,7 @@ class Wav2Vec2Classifier:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
 
-        self.processor = AutoProcessor.from_pretrained(str(model_dir))
+        self.processor = Wav2Vec2Processor.from_pretrained(str(model_dir))
         self.model = AutoModelForAudioClassification.from_pretrained(str(model_dir))
         self.model.to(self.device).eval()
 
