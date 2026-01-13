@@ -16,13 +16,15 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 # Copy application code
 COPY Code/ ./Code/
-COPY Models/ ./Models/
-COPY Results/ ./Results/
+COPY app.py .
 
-# Set port (Cloud Run uses PORT env var)
-ENV PORT=8080
-EXPOSE 8080
+# Create directories for models and results (will be downloaded at runtime from HF)
+RUN mkdir -p ./Models ./Results
+
+# Set port (HF Spaces and Cloud Run use PORT env var)
+ENV PORT=7860
+EXPOSE 7860
 
 # Run the application
-CMD exec python Code/serve_realtime_fastapi.py --host 0.0.0.0 --port ${PORT}
+CMD exec python app.py
 

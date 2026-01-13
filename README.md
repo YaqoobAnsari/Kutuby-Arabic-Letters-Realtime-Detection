@@ -1,6 +1,16 @@
+---
+title: Arabic Pronunciation Trainer
+emoji: 🔤
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+license: mit
+---
+
 # Arabic Alphabet Realtime — wav2vec2-base
 
-FastAPI demo for a fine-tuned **wav2vec2-base** model that classifies **Arabic letters** from short audio snippets (mic or file).  
+FastAPI demo for a fine-tuned **wav2vec2-base** model that classifies **Arabic letters** from short audio snippets (mic or file).
 No Gradio, no ffmpeg—just vanilla HTML/JS in the browser and a FastAPI backend. Uses GPU if available.
 
 **Model weights** are hosted on Hugging Face: [`yansari/arabic-letters-wav2vec2-base`](https://huggingface.co/yansari/arabic-letters-wav2vec2-base).  
