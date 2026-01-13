@@ -1031,7 +1031,7 @@ async def verify_letter(
         message = f"✗ Failed: '{target_letter}' only has {target_prob*100:.2f}% confidence (threshold: {threshold*100:.0f}%). Predicted: '{predicted_letter}' ({predicted_prob*100:.2f}%)"
 
     response_data = {
-        "result": result,
+        "result": bool(result),
         "target_letter": target_letter,
         "target_probability": float(target_prob),
         "predicted_letter": predicted_letter,
