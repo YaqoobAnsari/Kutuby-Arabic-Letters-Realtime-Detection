@@ -67,7 +67,7 @@ def preferred_model_dir(paths: Dict[str, Path]) -> Path:
     if bucket_name and HAVE_GCS:
         cache_dir = Path(tempfile.gettempdir()) / "gcs_models" / bucket_name.replace("/", "_")
         model_dir = cache_dir / "arabic-letters-wav2vec2-base"
-        
+
         # Download from GCS if not cached
         if not (model_dir / "config.json").exists():
             print(f"[GCS] Downloading model from gs://{bucket_name}/models/arabic-letters-wav2vec2-base")
@@ -88,10 +88,10 @@ def preferred_model_dir(paths: Dict[str, Path]) -> Path:
             except Exception as e:
                 print(f"[GCS] Error downloading model: {e}")
                 raise
-        
+
         if (model_dir / "config.json").exists():
             return model_dir
-    
+
     # Fall back to local filesystem
     res = paths["results"] / "facebook__wav2vec2-base" / "model"
     mod = paths["models"]  / "facebook__wav2vec2-base"
@@ -99,12 +99,11 @@ def preferred_model_dir(paths: Dict[str, Path]) -> Path:
         return res
     if (mod / "config.json").exists():
         return mod
-    raise FileNotFoundError(
-        f"Could not find the fine-tuned wav2vec2-base model.\n"
-        f"Looked in:\n  {res}\n  {mod}\n"
-        "Make sure finetune_eval.py finished for facebook/wav2vec2-base, "
-        "or set MODEL_BUCKET environment variable to load from GCS."
-    )
+
+    # If local model not found, use HuggingFace Hub model directly
+    # This returns the model ID string, which transformers will download automatically
+    print("[INFO] Local model not found, will load from HuggingFace Hub: yansari/arabic-letters-wav2vec2-base")
+    return "yansari/arabic-letters-wav2vec2-base"
 
 def optional_confusion_paths(paths: Dict[str, Path]) -> Tuple[Optional[Path], Optional[Path]]:
     png = paths["results"] / "facebook__wav2vec2-base" / "confusion_matrix.png"
