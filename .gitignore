@@ -32,3 +32,11 @@ Results/facebook__wav2vec2-base/*.safetensors
 Results/facebook__wav2vec2-base/*.pth
 Results/facebook__wav2vec2-base/test_predictions.csv
 Results/facebook__wav2vec2-base/confusion_matrix.csv
+
+# Docker & GCP
+.env
+.env.local
+*.key.json
+service-account*.json
+gcp-credentials.json
+.dockerignore.bak

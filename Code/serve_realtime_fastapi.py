@@ -16,7 +16,7 @@ Run:
 """
 
 from __future__ import annotations
-import os, io, time, json, argparse, base64, threading
+import os, io, time, json, argparse, base64, threading, tempfile
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple
 
@@ -27,7 +27,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import torch
-from fastapi import FastAPI, UploadFile, File, Response
+from fastapi import FastAPI, UploadFile, File, Form, Response
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, PlainTextResponse
 import uvicorn
 
@@ -38,6 +38,14 @@ except Exception:
     HAVE_RESAMPY = False
 
 from transformers import AutoProcessor, AutoModelForAudioClassification
+
+# Google Cloud Storage support (optional)
+try:
+    from google.cloud import storage
+    HAVE_GCS = True
+except ImportError:
+    HAVE_GCS = False
+    storage = None
 
 
 # --------------------------- Repo paths & model discovery ---------------------------
@@ -54,6 +62,37 @@ def resolve_repo_paths(script_file: Path) -> Dict[str, Path]:
     }
 
 def preferred_model_dir(paths: Dict[str, Path]) -> Path:
+    # Check if we should load from GCS (for Cloud Run deployment)
+    bucket_name = os.getenv("MODEL_BUCKET")
+    if bucket_name and HAVE_GCS:
+        cache_dir = Path(tempfile.gettempdir()) / "gcs_models" / bucket_name.replace("/", "_")
+        model_dir = cache_dir / "arabic-letters-wav2vec2-base"
+        
+        # Download from GCS if not cached
+        if not (model_dir / "config.json").exists():
+            print(f"[GCS] Downloading model from gs://{bucket_name}/models/arabic-letters-wav2vec2-base")
+            model_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                client = storage.Client()
+                bucket = client.bucket(bucket_name)
+                blobs = bucket.list_blobs(prefix="models/arabic-letters-wav2vec2-base/")
+                downloaded = 0
+                for blob in blobs:
+                    relative_path = blob.name.replace("models/arabic-letters-wav2vec2-base/", "")
+                    if relative_path and relative_path != blob.name:
+                        local_file = model_dir / relative_path
+                        local_file.parent.mkdir(parents=True, exist_ok=True)
+                        blob.download_to_filename(str(local_file))
+                        downloaded += 1
+                print(f"[GCS] Downloaded {downloaded} files to {model_dir}")
+            except Exception as e:
+                print(f"[GCS] Error downloading model: {e}")
+                raise
+        
+        if (model_dir / "config.json").exists():
+            return model_dir
+    
+    # Fall back to local filesystem
     res = paths["results"] / "facebook__wav2vec2-base" / "model"
     mod = paths["models"]  / "facebook__wav2vec2-base"
     if (res / "config.json").exists():
@@ -63,7 +102,8 @@ def preferred_model_dir(paths: Dict[str, Path]) -> Path:
     raise FileNotFoundError(
         f"Could not find the fine-tuned wav2vec2-base model.\n"
         f"Looked in:\n  {res}\n  {mod}\n"
-        "Make sure finetune_eval.py finished for facebook/wav2vec2-base."
+        "Make sure finetune_eval.py finished for facebook/wav2vec2-base, "
+        "or set MODEL_BUCKET environment variable to load from GCS."
     )
 
 def optional_confusion_paths(paths: Dict[str, Path]) -> Tuple[Optional[Path], Optional[Path]]:
@@ -92,10 +132,115 @@ def resample_if_needed(y: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
     return np.interp(x_new, x_old, y).astype(np.float32, copy=False)
 
 def pad_or_trim(y: np.ndarray, target_len: int) -> np.ndarray:
+    """Legacy function - kept for backward compatibility."""
     if len(y) >= target_len:
         return y[:target_len]
     pad = target_len - len(y)
     return np.pad(y, (0, pad), mode="constant")
+
+def smart_extract_segment(
+    audio: np.ndarray,
+    sr: int,
+    target_duration: float = 1.0,
+    energy_threshold: float = 0.01,
+    step_size: float = 0.05
+) -> Tuple[np.ndarray, Dict]:
+    """
+    Hybrid smart extraction: Try center segment first, fallback to highest energy window.
+    
+    Strategy:
+    1. Try center 1-second segment
+    2. If center energy < threshold, slide window to find highest energy segment
+    3. Extract best 1-second segment
+    
+    Parameters:
+    - audio: Input audio array (mono, float32)
+    - sr: Sample rate
+    - target_duration: Target duration in seconds (default 1.0)
+    - energy_threshold: RMS energy threshold for center acceptance (default 0.01)
+    - step_size: Step size for sliding window in seconds (default 0.05)
+    
+    Returns:
+    - extracted_segment: 1-second audio array
+    - metadata: dict with extraction info (method, energy, start_sample, etc.)
+    """
+    window_samples = int(target_duration * sr)
+    step_samples = int(step_size * sr)
+    audio_len = len(audio)
+    duration_sec = audio_len / sr
+    
+    print(f"[SMART_EXTRACT] Audio length: {audio_len} samples ({duration_sec:.2f}s) at {sr}Hz")
+    print(f"[SMART_EXTRACT] Target: {window_samples} samples ({target_duration}s)")
+    
+    # If audio is shorter than target, pad it
+    if audio_len < window_samples:
+        pad_samples = window_samples - audio_len
+        padded = np.pad(audio, (0, pad_samples), mode="constant")
+        print(f"[SMART_EXTRACT] Audio too short, padded {pad_samples} samples ({pad_samples/sr:.2f}s)")
+        return padded, {
+            "method": "padded",
+            "original_duration": duration_sec,
+            "target_duration": target_duration,
+            "padded_samples": pad_samples,
+            "energy": float(np.sqrt(np.mean(padded**2)))
+        }
+    
+    # Strategy 1: Try center segment
+    center_start = max(0, (audio_len - window_samples) // 2)
+    center_segment = audio[center_start:center_start + window_samples]
+    center_energy = float(np.sqrt(np.mean(center_segment**2)))  # RMS energy
+    
+    print(f"[SMART_EXTRACT] Center segment: start={center_start}, energy={center_energy:.6f}, threshold={energy_threshold:.6f}")
+    
+    if center_energy >= energy_threshold:
+        print(f"[SMART_EXTRACT] ✓ Center segment accepted (energy {center_energy:.6f} >= threshold {energy_threshold:.6f})")
+        return center_segment, {
+            "method": "center",
+            "energy": center_energy,
+            "start_sample": int(center_start),
+            "start_time_sec": float(center_start / sr),
+            "threshold": energy_threshold,
+            "original_duration": duration_sec
+        }
+    
+    # Strategy 2: Find highest energy window
+    print(f"[SMART_EXTRACT] Center energy too low, searching for highest energy window...")
+    print(f"[SMART_EXTRACT] Sliding window: step={step_samples} samples ({step_size}s), {len(range(0, audio_len - window_samples + 1, step_samples))} positions")
+    
+    max_energy = 0.0
+    best_start = 0
+    energies = []
+    
+    for start in range(0, audio_len - window_samples + 1, step_samples):
+        window = audio[start:start + window_samples]
+        energy = float(np.sqrt(np.mean(window**2)))  # RMS energy
+        energies.append(energy)
+        
+        if energy > max_energy:
+            max_energy = energy
+            best_start = start
+    
+    best_segment = audio[best_start:best_start + window_samples]
+    best_start_time = best_start / sr
+    
+    print(f"[SMART_EXTRACT] ✓ Found best segment: start={best_start} ({best_start_time:.2f}s), energy={max_energy:.6f}")
+    print(f"[SMART_EXTRACT] Energy range: min={min(energies):.6f}, max={max_energy:.6f}, mean={np.mean(energies):.6f}")
+    
+    return best_segment, {
+        "method": "energy_based",
+        "energy": max_energy,
+        "center_energy": center_energy,
+        "start_sample": int(best_start),
+        "start_time_sec": float(best_start_time),
+        "threshold": energy_threshold,
+        "original_duration": duration_sec,
+        "energy_stats": {
+            "min": float(min(energies)),
+            "max": float(max_energy),
+            "mean": float(np.mean(energies)),
+            "std": float(np.std(energies))
+        }
+    }
 
 
 # --------------------------- Plot helpers (return base64 PNG) ---------------------------
@@ -170,12 +315,38 @@ class Wav2Vec2Classifier:
         y: np.ndarray,
         sr_in: int,
         top_k: int = 5,
-        fixed_seconds: float = 1.0
+        fixed_seconds: float = 1.0,
+        use_smart_extraction: bool = True,
+        energy_threshold: float = 0.01
     ) -> Dict:
+        print(f"[INFER] Starting inference: sr_in={sr_in}, top_k={top_k}, fixed_seconds={fixed_seconds}")
+        print(f"[INFER] Input audio shape: {y.shape}, dtype={y.dtype}")
+        
         y = to_mono(y)
+        print(f"[INFER] After mono conversion: shape={y.shape}")
+        
         y = resample_if_needed(y, sr_in, self.sampling_rate)
+        print(f"[INFER] After resampling to {self.sampling_rate}Hz: shape={y.shape}, duration={len(y)/self.sampling_rate:.2f}s")
+        
+        # Use smart extraction instead of pad_or_trim
+        if use_smart_extraction:
+            print(f"[INFER] Using smart extraction (threshold={energy_threshold})")
+            y, extraction_metadata = smart_extract_segment(
+                y, 
+                self.sampling_rate, 
+                target_duration=fixed_seconds,
+                energy_threshold=energy_threshold,
+                step_size=0.05  # Finest granularity
+            )
+            print(f"[INFER] Extraction method: {extraction_metadata['method']}")
+        else:
+            print(f"[INFER] Using legacy pad_or_trim")
+            max_len = int(round(fixed_seconds * self.sampling_rate))
+            y = pad_or_trim(y, max_len)
+            extraction_metadata = {"method": "legacy_pad_or_trim"}
+        
         max_len = int(round(fixed_seconds * self.sampling_rate))
-        y = pad_or_trim(y, max_len)
+        print(f"[INFER] Final audio length: {len(y)} samples ({len(y)/self.sampling_rate:.2f}s), target={max_len}")
 
         t0 = time.perf_counter()
         inputs = self.processor(
@@ -197,7 +368,7 @@ class Wav2Vec2Classifier:
         labels = [self.id2label[int(i)] for i in idxs]
         scores = [float(probs[i]) for i in idxs]
 
-        return {
+        result = {
             "top1_label": labels[0],
             "top1_prob": scores[0],
             "topk": list(zip(labels, scores)),
@@ -206,6 +377,14 @@ class Wav2Vec2Classifier:
             "sr_used": self.sampling_rate,
             "processed_audio": y,  # return for plotting
         }
+        
+        # Add extraction metadata if available
+        if use_smart_extraction and 'extraction_metadata' in locals():
+            result["extraction_metadata"] = extraction_metadata
+        
+        print(f"[INFER] Inference complete: top1={labels[0]} ({scores[0]:.4f}), latency={result['latency_ms']:.2f}ms")
+        
+        return result
 
 
 # --------------------------- App state ---------------------------
@@ -690,17 +869,22 @@ def index():
 
 @app.post("/infer", response_class=JSONResponse)
 async def infer(audio: UploadFile = File(...), top_k: str = "5", fixed_seconds: str = "1.0"):
+    print(f"\n[API] /infer endpoint called")
     model = _load_once()
 
     # Read WAV (client encodes WAV; server needs only soundfile)
     content = await audio.read()
+    print(f"[API] Received audio file: {len(content)} bytes")
     try:
         y, sr = sf.read(io.BytesIO(content), dtype="float32", always_2d=False)
+        print(f"[API] Audio loaded: shape={y.shape}, sr={sr}, duration={len(y)/sr:.2f}s")
     except Exception as e:
+        print(f"[API] ERROR: Could not read audio - {type(e).__name__}: {e}")
         return PlainTextResponse(f"Could not read audio (expect WAV). Error: {type(e).__name__}: {e}", status_code=400)
 
     if y.ndim > 1:
         y = y.mean(axis=1)
+        print(f"[API] Converted to mono: shape={y.shape}")
 
     try:
         tk = int(top_k)
@@ -710,8 +894,13 @@ async def infer(audio: UploadFile = File(...), top_k: str = "5", fixed_seconds: 
         fx = float(fixed_seconds)
     except:
         fx = 1.0
-
-    out = model.infer_numpy(y, sr_in=sr, top_k=tk, fixed_seconds=fx)
+    
+    print(f"[API] Parameters: top_k={tk}, fixed_seconds={fx}")
+    
+    # Get energy threshold from environment or use default
+    energy_threshold = float(os.getenv("ENERGY_THRESHOLD", "0.01"))
+    
+    out = model.infer_numpy(y, sr_in=sr, top_k=tk, fixed_seconds=fx, use_smart_extraction=True, energy_threshold=energy_threshold)
 
     # Visuals
     wave_b64 = plot_waveform_b64(y, sr)
@@ -728,7 +917,7 @@ async def infer(audio: UploadFile = File(...), top_k: str = "5", fixed_seconds: 
         f"<div><b>Size</b>: {model.size_mb} MB</div>"
     )
 
-    return JSONResponse({
+    response_data = {
         "top1_label": out["top1_label"],
         "top1_prob": float(out["top1_prob"]),
         "topk": out["topk"],
@@ -738,7 +927,130 @@ async def infer(audio: UploadFile = File(...), top_k: str = "5", fixed_seconds: 
         "model_info_html": info_html,
         "confusion_available": _CONF_PNG is not None,
         "per_class_available": _CONF_CSV is not None,
-    })
+    }
+    
+    # Add extraction metadata if available
+    if "extraction_metadata" in out:
+        response_data["extraction_metadata"] = out["extraction_metadata"]
+        print(f"[API] Added extraction metadata: method={out['extraction_metadata'].get('method')}")
+    
+    print(f"[API] Response ready: top1={response_data['top1_label']} ({response_data['top1_prob']:.4f})\n")
+    
+    return JSONResponse(response_data)
+
+
+# --------------------------- Letter Verification Endpoint (for Postman) ---------------------------
+
+@app.post("/verify_letter", response_class=JSONResponse)
+async def verify_letter(
+    audio: UploadFile = File(...),
+    target_letter: str = Form(...),
+    threshold: float = Form(0.6),
+    fixed_seconds: str = Form("1.0")
+):
+    """
+    Endpoint for verifying if an audio file matches a target Arabic letter.
+
+    Parameters:
+    - audio: WAV file (1-2 seconds duration)
+    - target_letter: The expected Arabic letter (e.g., "Alif", "Ba", "Ta")
+    - threshold: Confidence threshold (default 0.6 = 60%)
+    - fixed_seconds: Audio window length (default 1.0)
+
+    Returns:
+    - result: True if target_letter probability >= threshold, False otherwise
+    - predicted_letter: The letter with highest probability
+    - predicted_probability: The probability of the predicted letter
+    - target_probability: The probability of the target letter
+    - message: Human-readable explanation
+    """
+    print(f"\n[API] /verify_letter endpoint called: target={target_letter}, threshold={threshold}")
+    model = _load_once()
+
+    # Read audio file
+    content = await audio.read()
+    print(f"[API] Received audio file: {len(content)} bytes")
+    try:
+        y, sr = sf.read(io.BytesIO(content), dtype="float32", always_2d=False)
+        print(f"[API] Audio loaded: shape={y.shape}, sr={sr}, duration={len(y)/sr:.2f}s")
+    except Exception as e:
+        print(f"[API] ERROR: Could not read audio - {type(e).__name__}: {e}")
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"Could not read audio file. Expected WAV format. Error: {type(e).__name__}: {e}",
+                "result": False
+            }
+        )
+
+    # Convert to mono if needed
+    if y.ndim > 1:
+        y = y.mean(axis=1)
+        print(f"[API] Converted to mono: shape={y.shape}")
+
+    # Parse fixed_seconds
+    try:
+        fx = float(fixed_seconds)
+    except:
+        fx = 1.0
+    
+    print(f"[API] Parameters: fixed_seconds={fx}, threshold={threshold}")
+    
+    # Get energy threshold from environment or use default
+    energy_threshold = float(os.getenv("ENERGY_THRESHOLD", "0.01"))
+    
+    # Run inference
+    out = model.infer_numpy(y, sr_in=sr, top_k=len(model.id2label), fixed_seconds=fx, use_smart_extraction=True, energy_threshold=energy_threshold)
+
+    # Get all probabilities as a dict {label: probability}
+    probs_dict = {model.id2label[i]: prob for i, prob in enumerate(out["probs"])}
+
+    # Check if target letter exists in model's vocabulary
+    if target_letter not in probs_dict:
+        available_letters = ", ".join(sorted(probs_dict.keys()))
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"Target letter '{target_letter}' not found in model vocabulary.",
+                "available_letters": available_letters,
+                "result": False
+            }
+        )
+
+    # Get target letter probability
+    target_prob = probs_dict[target_letter]
+    predicted_letter = out["top1_label"]
+    predicted_prob = out["top1_prob"]
+
+    # Verify if target letter meets threshold
+    result = target_prob >= threshold
+
+    # Generate message
+    if result:
+        message = f"✓ Success: '{target_letter}' detected with {target_prob*100:.2f}% confidence (threshold: {threshold*100:.0f}%)"
+    else:
+        message = f"✗ Failed: '{target_letter}' only has {target_prob*100:.2f}% confidence (threshold: {threshold*100:.0f}%). Predicted: '{predicted_letter}' ({predicted_prob*100:.2f}%)"
+
+    response_data = {
+        "result": result,
+        "target_letter": target_letter,
+        "target_probability": float(target_prob),
+        "predicted_letter": predicted_letter,
+        "predicted_probability": float(predicted_prob),
+        "threshold": float(threshold),
+        "message": message,
+        "latency_ms": float(out["latency_ms"]),
+        "all_probabilities": {k: float(v) for k, v in probs_dict.items()}
+    }
+    
+    # Add extraction metadata if available
+    if "extraction_metadata" in out:
+        response_data["extraction_metadata"] = out["extraction_metadata"]
+        print(f"[API] Added extraction metadata: method={out['extraction_metadata'].get('method')}")
+    
+    print(f"[API] Verification result: {result} - {message}\n")
+    
+    return JSONResponse(response_data)
 
 
 # --------------------------- CLI & optional ngrok share ---------------------------
