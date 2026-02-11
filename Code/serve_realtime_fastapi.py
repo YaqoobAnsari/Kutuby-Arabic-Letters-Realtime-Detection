@@ -16,7 +16,7 @@ Run:
 """
 
 from __future__ import annotations
-import os, io, time, json, argparse, base64, threading, tempfile
+import os, io, time, json, argparse, base64, threading, tempfile, subprocess
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple
 
@@ -46,6 +46,52 @@ try:
 except ImportError:
     HAVE_GCS = False
     storage = None
+
+
+# --------------------------- Label Mapping (Frontend ↔ Model) ---------------------------
+# Frontend uses standardized labels, model uses training labels
+# This mapping allows the API to accept frontend labels and return frontend labels
+
+FRONTEND_TO_MODEL = {
+    "Ayn": "Aain",
+    "Alif": "Alif",
+    "Baa": "Ba",
+    "Dal": "Dal",
+    "Dhaad": "Daud",
+    "Faa": "Faa",
+    "Ghayn": "Ghain",
+    "Ha": "Haa",      # ه - soft H
+    "Haa": "Hha",     # ح - deep H
+    "Jeem": "Jeem",
+    "Kaaf": "Kaaf",
+    "Khaa": "Kha",
+    "Laam": "Laam",
+    "Meem": "Meem",
+    "Noon": "Noon",
+    "Qaaf": "Qauf",
+    "Raa": "Raa",
+    "Thaa": "Saa",
+    "Saad": "Saud",
+    "Seen": "Seen",
+    "Sheen": "Sheen",
+    "Taa": "Ta",
+    "Toh": "Tua",     # ط - emphatic T
+    "Waw": "Wao",
+    "Ya": "Yaa",
+    "Zay": "Zaa",
+    "Dhah": "Zhal",   # ظ - emphatic
+    "Thal": "Zua",
+}
+
+MODEL_TO_FRONTEND = {v: k for k, v in FRONTEND_TO_MODEL.items()}
+
+def translate_to_model_label(frontend_label: str) -> str:
+    """Convert frontend label to model label. Returns original if not found."""
+    return FRONTEND_TO_MODEL.get(frontend_label, frontend_label)
+
+def translate_to_frontend_label(model_label: str) -> str:
+    """Convert model label to frontend label. Returns original if not found."""
+    return MODEL_TO_FRONTEND.get(model_label, model_label)
 
 
 # --------------------------- Repo paths & model discovery ---------------------------
@@ -240,6 +286,114 @@ def smart_extract_segment(
             "std": float(np.std(energies))
         }
     }
+
+
+def load_audio_robust(audio_data: bytes, sr: int = 16000) -> Tuple[np.ndarray, int]:
+    """
+    Load audio with multiple fallback methods for maximum format compatibility.
+    Handles WAV, WebM, Ogg, M4A, and other formats.
+
+    Tries in order:
+    1. soundfile (fastest, handles WAV natively)
+    2. FFmpeg subprocess (fast, handles WebM/Ogg/M4A)
+    3. librosa with temp file (slower fallback)
+    4. pydub (alternative decoder)
+
+    Returns:
+        Tuple of (mono_audio_array_float32, sample_rate)
+    """
+    errors = []
+
+    # Method 1: Try soundfile directly (fastest for WAV)
+    try:
+        print("[AUDIO] Trying soundfile (direct BytesIO)")
+        y, original_sr = sf.read(io.BytesIO(audio_data), dtype="float32", always_2d=False)
+        if y.ndim > 1:
+            y = y.mean(axis=1)
+        if original_sr != sr:
+            y = resample_if_needed(y, original_sr, sr)
+        y = y.astype(np.float32, copy=False)
+        print(f"[AUDIO] Loaded via soundfile: {len(y)} samples at {sr}Hz")
+        return y, sr
+    except Exception as e:
+        errors.append(f"soundfile: {type(e).__name__}: {e}")
+        print(f"[AUDIO] soundfile failed: {e}")
+
+    # Method 2: Try FFmpeg directly (fast - handles WebM/Ogg/M4A)
+    try:
+        print("[AUDIO] Trying FFmpeg direct decode")
+        cmd = [
+            'ffmpeg',
+            '-i', 'pipe:0',
+            '-f', 'wav',
+            '-acodec', 'pcm_s16le',
+            '-ar', str(sr),
+            '-ac', '1',
+            'pipe:1'
+        ]
+        result = subprocess.run(
+            cmd,
+            input=audio_data,
+            capture_output=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            y, _ = sf.read(io.BytesIO(result.stdout), dtype="float32", always_2d=False)
+            y = y.astype(np.float32, copy=False)
+            print(f"[AUDIO] Loaded via FFmpeg: {len(y)} samples at {sr}Hz")
+            return y, sr
+        else:
+            raise Exception(f"FFmpeg exit code {result.returncode}: {result.stderr.decode()[:200]}")
+    except Exception as e:
+        errors.append(f"FFmpeg: {type(e).__name__}: {e}")
+        print(f"[AUDIO] FFmpeg failed: {e}")
+
+    # Method 3: Try librosa with temp file
+    try:
+        print("[AUDIO] Trying librosa+tempfile")
+        import librosa
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as tmp_file:
+            tmp_file.write(audio_data)
+            tmp_path = tmp_file.name
+        try:
+            y, _ = librosa.load(tmp_path, sr=sr, mono=True)
+            y = y.astype(np.float32, copy=False)
+            print(f"[AUDIO] Loaded via librosa: {len(y)} samples at {sr}Hz")
+            return y, sr
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+    except Exception as e:
+        errors.append(f"librosa: {type(e).__name__}: {e}")
+        print(f"[AUDIO] librosa failed: {e}")
+
+    # Method 4: Try pydub (alternative decoder)
+    try:
+        print("[AUDIO] Trying pydub")
+        from pydub import AudioSegment
+        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+            tmp_file.write(audio_data)
+            tmp_path = tmp_file.name
+        try:
+            audio = AudioSegment.from_file(tmp_path)
+            if audio.channels > 1:
+                audio = audio.set_channels(1)
+            audio = audio.set_frame_rate(sr)
+            y = np.array(audio.get_array_of_samples()).astype(np.float32)
+            y = y / (2**15)  # Normalize to [-1, 1]
+            print(f"[AUDIO] Loaded via pydub: {len(y)} samples at {sr}Hz")
+            return y, sr
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+    except Exception as e:
+        errors.append(f"pydub: {type(e).__name__}: {e}")
+        print(f"[AUDIO] pydub failed: {e}")
+
+    # All methods failed
+    error_msg = "All audio loading methods failed:\n" + "\n".join(f"  - {err}" for err in errors)
+    print(f"[AUDIO] {error_msg}")
+    raise Exception(error_msg)
 
 
 # --------------------------- Plot helpers (return base64 PNG) ---------------------------
@@ -871,27 +1025,23 @@ async def infer(audio: UploadFile = File(...), top_k: str = "5", fixed_seconds: 
     print(f"\n[API] /infer endpoint called")
     model = _load_once()
 
-    # Read WAV (client encodes WAV; server needs only soundfile)
+    # Read audio (supports WAV, WebM, Ogg, M4A via fallback chain)
     content = await audio.read()
     print(f"[API] Received audio file: {len(content)} bytes")
     try:
-        y, sr = sf.read(io.BytesIO(content), dtype="float32", always_2d=False)
+        y, sr = load_audio_robust(content, sr=16000)
         print(f"[API] Audio loaded: shape={y.shape}, sr={sr}, duration={len(y)/sr:.2f}s")
     except Exception as e:
         print(f"[API] ERROR: Could not read audio - {type(e).__name__}: {e}")
-        return PlainTextResponse(f"Could not read audio (expect WAV). Error: {type(e).__name__}: {e}", status_code=400)
-
-    if y.ndim > 1:
-        y = y.mean(axis=1)
-        print(f"[API] Converted to mono: shape={y.shape}")
+        return PlainTextResponse(f"Could not read audio. Error: {type(e).__name__}: {e}", status_code=400)
 
     try:
         tk = int(top_k)
-    except:
+    except (ValueError, TypeError):
         tk = 5
     try:
         fx = float(fixed_seconds)
-    except:
+    except (ValueError, TypeError):
         fx = 1.0
     
     print(f"[API] Parameters: top_k={tk}, fixed_seconds={fx}")
@@ -901,9 +1051,10 @@ async def infer(audio: UploadFile = File(...), top_k: str = "5", fixed_seconds: 
     
     out = model.infer_numpy(y, sr_in=sr, top_k=tk, fixed_seconds=fx, use_smart_extraction=True, energy_threshold=energy_threshold)
 
-    # Visuals
-    wave_b64 = plot_waveform_b64(y, sr)
-    labels_all = [model.id2label[i] for i in range(len(model.id2label))]
+    # Visuals — plot the processed 1s segment the model actually used
+    wave_b64 = plot_waveform_b64(out["processed_audio"], model.sampling_rate)
+    # Translate model labels to frontend labels for the probability bar chart
+    labels_all = [translate_to_frontend_label(model.id2label[i]) for i in range(len(model.id2label))]
     prob_b64 = plot_prob_bars_b64(labels_all, np.asarray(out["probs"]), top=min(tk, len(labels_all)))
 
     # Stats
@@ -916,10 +1067,14 @@ async def infer(audio: UploadFile = File(...), top_k: str = "5", fixed_seconds: 
         f"<div><b>Size</b>: {model.size_mb} MB</div>"
     )
 
+    # Translate model labels to frontend labels in the response
+    frontend_top1 = translate_to_frontend_label(out["top1_label"])
+    frontend_topk = [(translate_to_frontend_label(lab), score) for lab, score in out["topk"]]
+
     response_data = {
-        "top1_label": out["top1_label"],
+        "top1_label": frontend_top1,
         "top1_prob": float(out["top1_prob"]),
-        "topk": out["topk"],
+        "topk": frontend_topk,
         "latency_ms": float(out["latency_ms"]),
         "prob_b64": prob_b64,
         "wave_b64": wave_b64,
@@ -963,34 +1118,38 @@ async def verify_letter(
     - target_probability: The probability of the target letter
     - message: Human-readable explanation
     """
+    # Clamp threshold to valid range
+    threshold = max(0.0, min(1.0, threshold))
     print(f"\n[API] /verify_letter endpoint called: target={target_letter}, threshold={threshold}")
     model = _load_once()
 
-    # Read audio file
+    # Translate frontend label to model label
+    original_target = target_letter
+    model_target = translate_to_model_label(target_letter)
+    if model_target != target_letter:
+        print(f"[API] Label mapping: '{target_letter}' → '{model_target}'")
+    target_letter = model_target
+
+    # Read audio file (supports WAV, WebM, Ogg, M4A via fallback chain)
     content = await audio.read()
     print(f"[API] Received audio file: {len(content)} bytes")
     try:
-        y, sr = sf.read(io.BytesIO(content), dtype="float32", always_2d=False)
+        y, sr = load_audio_robust(content, sr=16000)
         print(f"[API] Audio loaded: shape={y.shape}, sr={sr}, duration={len(y)/sr:.2f}s")
     except Exception as e:
         print(f"[API] ERROR: Could not read audio - {type(e).__name__}: {e}")
         return JSONResponse(
             status_code=400,
             content={
-                "error": f"Could not read audio file. Expected WAV format. Error: {type(e).__name__}: {e}",
+                "error": f"Could not read audio file. Error: {type(e).__name__}: {e}",
                 "result": False
             }
         )
 
-    # Convert to mono if needed
-    if y.ndim > 1:
-        y = y.mean(axis=1)
-        print(f"[API] Converted to mono: shape={y.shape}")
-
     # Parse fixed_seconds
     try:
         fx = float(fixed_seconds)
-    except:
+    except (ValueError, TypeError):
         fx = 1.0
     
     print(f"[API] Parameters: fixed_seconds={fx}, threshold={threshold}")
@@ -1001,45 +1160,49 @@ async def verify_letter(
     # Run inference
     out = model.infer_numpy(y, sr_in=sr, top_k=len(model.id2label), fixed_seconds=fx, use_smart_extraction=True, energy_threshold=energy_threshold)
 
-    # Get all probabilities as a dict {label: probability}
-    probs_dict = {model.id2label[i]: prob for i, prob in enumerate(out["probs"])}
+    # Get all probabilities as a dict {model_label: probability}
+    model_probs_dict = {model.id2label[i]: prob for i, prob in enumerate(out["probs"])}
+
+    # Also create frontend-labeled version for response
+    frontend_probs_dict = {translate_to_frontend_label(k): v for k, v in model_probs_dict.items()}
 
     # Check if target letter exists in model's vocabulary
-    if target_letter not in probs_dict:
-        available_letters = ", ".join(sorted(probs_dict.keys()))
+    if target_letter not in model_probs_dict:
+        available_frontend_letters = ", ".join(sorted(frontend_probs_dict.keys()))
         return JSONResponse(
             status_code=400,
             content={
-                "error": f"Target letter '{target_letter}' not found in model vocabulary.",
-                "available_letters": available_letters,
+                "error": f"Target letter '{original_target}' not found in model vocabulary.",
+                "available_letters": available_frontend_letters,
                 "result": False
             }
         )
 
     # Get target letter probability
-    target_prob = probs_dict[target_letter]
-    predicted_letter = out["top1_label"]
+    target_prob = model_probs_dict[target_letter]
+    predicted_model_label = out["top1_label"]
+    predicted_frontend_label = translate_to_frontend_label(predicted_model_label)
     predicted_prob = out["top1_prob"]
 
     # Verify if target letter meets threshold
     result = target_prob >= threshold
 
-    # Generate message
+    # Generate message using frontend labels
     if result:
-        message = f"✓ Success: '{target_letter}' detected with {target_prob*100:.2f}% confidence (threshold: {threshold*100:.0f}%)"
+        message = f"✓ Success: '{original_target}' detected with {target_prob*100:.2f}% confidence (threshold: {threshold*100:.0f}%)"
     else:
-        message = f"✗ Failed: '{target_letter}' only has {target_prob*100:.2f}% confidence (threshold: {threshold*100:.0f}%). Predicted: '{predicted_letter}' ({predicted_prob*100:.2f}%)"
+        message = f"✗ Failed: '{original_target}' only has {target_prob*100:.2f}% confidence (threshold: {threshold*100:.0f}%). Predicted: '{predicted_frontend_label}' ({predicted_prob*100:.2f}%)"
 
     response_data = {
         "result": bool(result),
-        "target_letter": target_letter,
+        "target_letter": original_target,
         "target_probability": float(target_prob),
-        "predicted_letter": predicted_letter,
+        "predicted_letter": predicted_frontend_label,
         "predicted_probability": float(predicted_prob),
         "threshold": float(threshold),
         "message": message,
         "latency_ms": float(out["latency_ms"]),
-        "all_probabilities": {k: float(v) for k, v in probs_dict.items()}
+        "all_probabilities": {k: float(v) for k, v in frontend_probs_dict.items()}
     }
     
     # Add extraction metadata if available

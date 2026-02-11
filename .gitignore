@@ -3,6 +3,7 @@
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+tmpclaude-*
 
 # Large data
 Dataset/
